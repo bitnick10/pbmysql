@@ -4,8 +4,12 @@
 #include <fmt/format.h>
 #include <google/protobuf/message.h>
 
+#ifdef  GetMessage
+#undef  GetMessage
+#endif
+
 namespace pbmysql {
-using namespace mysqlx;
+
 inline std::string GetMySQLTypeName(const std::string& messageTypeName) {
     if (messageTypeName == "string")
         return "TEXT";
@@ -50,6 +54,16 @@ inline std::string ToInsertString(const google::protobuf::Message& m, const std:
         case google::protobuf::FieldDescriptor::CPPTYPE_DOUBLE:
             query += fmt::format("{0},", refl->GetDouble(m, field));
             break;
+        case google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE: {
+            const google::protobuf::Message& subm = refl->GetMessage(m, field);
+            const Descriptor* subdesc = subm.GetDescriptor();
+            const Reflection* subrefl = subm.GetReflection();
+            const FieldDescriptor* subfield = subdesc->field(0);
+            if (subdesc->name() == "Timestamp") {
+                query += fmt::format("FROM_UNIXTIME({0}),", subrefl->GetInt64(subm, subfield));
+            }
+            break;
+        }
         default:
             assert(false);
             break;
@@ -69,7 +83,15 @@ inline std::string ToCreateTableQuery(const google::protobuf::Message& m, const 
 
     for (int i = 0; i < fieldCount; i++) {
         const FieldDescriptor* field = desc->field(i);
-        query += fmt::format("{0} {1},", field->name(), GetMySQLTypeName(field->type_name()));
+        if (field->type() == FieldDescriptor::TYPE_MESSAGE) {
+            const google::protobuf::Message& sub = refl->GetMessage(m, field);
+            const Descriptor* subdesc = sub.GetDescriptor();
+            if (subdesc->name() == "Timestamp") {
+                query += fmt::format("{0} {1},", field->name(), "TIMESTAMP");
+            }
+        } else {
+            query += fmt::format("{0} {1},", field->name(), GetMySQLTypeName(field->type_name()));
+        }
     }
     query += "PRIMARY KEY (" + primaryKey + "));";
     return query;
@@ -90,20 +112,37 @@ inline void ReplaceInto(mysqlx::Session& sess, const google::protobuf::Message& 
         std::cout << e.what();
     }
 }
+inline std::vector<std::string> GetColumnNames(const google::protobuf::Message& m) {
+    using namespace google::protobuf;
+    std::vector<std::string> ret;
+    const Descriptor* desc = m.GetDescriptor();
+    const Reflection* refl = m.GetReflection();
+    int fieldCount = desc->field_count();
+
+    for (int i = 0; i < fieldCount; i++) {
+        const FieldDescriptor* field = desc->field(i);
+        if (field->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
+            ret.push_back("UNIX_TIMESTAMP(" + field->name() + ")");
+        } else {
+            ret.push_back(field->name());
+        }
+    }
+    return ret;
+}
 template<typename T>
 std::vector<T> Select(mysqlx::Table& table, const std::string& condition = "") {
+    using namespace google::protobuf;
     std::vector<T> ret;
     T m;
-    using namespace google::protobuf;
     const Descriptor* desc = m.GetDescriptor();
     const Reflection* refl = m.GetReflection();
     int fieldCount = desc->field_count();
     std::string tableName = desc->name();
 
-    RowResult res = table.select("*").where(condition).execute();
-    std::list<Row> rows = res.fetchAll();
+    auto res = table.select(GetColumnNames(m)).where(condition).execute();
+    std::list<mysqlx::Row> rows = res.fetchAll();
 
-    for (Row & row : rows) {
+    for (auto & row : rows) {
         for (int i = 0; i < fieldCount; i++) {
             const FieldDescriptor* field = desc->field(i);
             switch (field->cpp_type()) {
@@ -122,6 +161,16 @@ std::vector<T> Select(mysqlx::Table& table, const std::string& condition = "") {
             case google::protobuf::FieldDescriptor::CPPTYPE_DOUBLE:
                 refl->SetDouble(&m, field, row[i].get<double>());
                 break;
+            case google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE: {
+                google::protobuf::Message& subm = const_cast<google::protobuf::Message&>(refl->GetMessage(m, field));
+                const Descriptor* subdesc = subm.GetDescriptor();
+                const Reflection* subrefl = subm.GetReflection();
+                const FieldDescriptor* subfield = subdesc->field(0);
+                if (subdesc->name() == "Timestamp") {
+                    subrefl->SetInt64(&subm, subfield, row[i].get<std::int64_t>());
+                }
+                break;
+            }
             default:
                 assert(false);
                 break;
